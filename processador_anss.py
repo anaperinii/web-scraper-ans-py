@@ -28,18 +28,18 @@ class ANSProcessor:
             'AMB': 'Seg. Ambulatorial'
         }
         self.expected_columns = [
-            'PROCEDIMENTO', 'RN_alteracao', 'VIGENCIA', 'OD', 'AMB',
+            'PROCEDIMENTO', 'RN_alteracao', 'VIGENCIA', 'Seg. Odontológica', 'Seg. Ambulatorial',
             'HCO', 'HSO', 'REF', 'PAC', 'DUT', 'SUBGRUPO',
             'GRUPO', 'CAPITULO'
         ]
 
     def _create_directories(self):
-        
+        """Cria os diretórios necessários para o processamento"""
         os.makedirs(self.download_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
 
     def _download_file(self, url: str, filename: str) -> str:
-       
+        """Baixa um arquivo da URL especificada"""
         local_path = os.path.join(self.download_dir, filename)
         
         try:
@@ -55,6 +55,7 @@ class ANSProcessor:
             raise
 
     def find_anexo_i_url(self) -> str:
+        """Encontra a URL do Anexo I no portal da ANS"""
         try:
             response = requests.get(self.base_url)
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -71,11 +72,10 @@ class ANSProcessor:
             raise
 
     def extract_tables_from_pdf(self, pdf_path: str) -> pd.DataFrame:
-        
+        """Extrai tabelas de um arquivo PDF"""
         try:
             logging.info("Iniciando extração de tabelas do PDF...")
             
-            # Extrai todas as tabelas de todas as páginas
             tables = tabula.read_pdf(
                 pdf_path,
                 pages='all',
@@ -86,14 +86,10 @@ class ANSProcessor:
                 silent=True
             )
             
-            # Processa os cabeçalhos e concatena as tabelas
             processed_tables = []
             for table in tables:
-                if len(table.columns) > 3:  # Filtra tabelas válidas
-                    # Remove colunas totalmente vazias
+                if len(table.columns) > 3:
                     table = table.dropna(axis=1, how='all')
-                    
-                    # Usa a primeira linha como cabeçalho
                     new_header = table.iloc[0]
                     table = table[1:]
                     table.columns = new_header
@@ -104,7 +100,6 @@ class ANSProcessor:
             
             full_table = pd.concat(processed_tables, ignore_index=True)
             
-            # Verifica se temos colunas suficientes
             if len(full_table.columns) < len(self.expected_columns):
                 raise ValueError(f"O número de colunas extraídas ({len(full_table.columns)}) é menor que o esperado ({len(self.expected_columns)})")
             
@@ -119,41 +114,42 @@ class ANSProcessor:
         if not isinstance(text, str):
             return text
             
-        # Remove acentos
         text = normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII')
-        # Remove caracteres especiais exceto vírgulas e pontos
         text = re.sub(r'[^\w\s,.;-]', '', text)
-        # Substitui múltiplos espaços por um único
         text = re.sub(r'\s+', ' ', text).strip()
-        # Substitui quebras de linha por espaço
         text = text.replace('\n', ' ').replace('\r', ' ')
         
         return text
+
+    def _replace_abbreviations(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Substitui abreviações pelos valores completos"""
+        for col, full_name in self.abbreviations.items():
+            if col in df.columns:
+                df[col] = df[col].apply(
+                    lambda x: full_name if str(x).strip().upper() == col else x
+                )
+        return df
 
     def clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Limpa e formata o DataFrame antes de salvar"""
         try:
             logging.info("Limpando e formatando dados...")
             
-            # Remove linhas totalmente vazias
             df = df.dropna(how='all')
-            
-            # Normaliza nomes das colunas
             df.columns = [self.normalize_text(col) for col in df.columns]
             
-            # Remove colunas extras se houver mais que o esperado
             if len(df.columns) > len(self.expected_columns):
                 df = df.iloc[:, :len(self.expected_columns)]
             
-            # Renomeia colunas para os nomes padrão
             df.columns = self.expected_columns[:len(df.columns)]
             
-            # Aplica limpeza em todas as colunas de texto
+            # Aplica a substituição das abreviações
+            df = self._replace_abbreviations(df)
+            
             for col in df.select_dtypes(include=['object']).columns:
                 df[col] = df[col].astype(str).apply(self.normalize_text)
                 df[col] = df[col].replace({'nan': '', 'None': '', 'NaT': ''})
             
-            # Preenche valores NaN com string vazia
             df = df.fillna('')
             
             logging.info("Dados limpos e formatados")
@@ -167,29 +163,25 @@ class ANSProcessor:
         try:
             csv_path = os.path.join(self.output_dir, filename)
             
-            # Configurações para melhor formatação
             df.to_csv(
                 csv_path,
                 index=False,
                 encoding='utf-8-sig',
-                sep=';',  
+                sep=';',
                 quotechar='"',
                 quoting=csv.QUOTE_MINIMAL,
                 lineterminator='\n'
             )
             
-            # Pós-processamento para garantir formatação correta
             with open(csv_path, 'r', encoding='utf-8-sig') as f:
                 lines = f.readlines()
             
-            # Remove linhas vazias e espaços extras
             cleaned_lines = []
             for line in lines:
                 line = line.strip()
                 if line:
                     cleaned_lines.append(line + '\n')
             
-            # Reescreve o arquivo
             with open(csv_path, 'w', encoding='utf-8-sig') as f:
                 f.writelines(cleaned_lines)
             
@@ -200,7 +192,7 @@ class ANSProcessor:
             raise
 
     def create_zip(self, csv_path: str, zip_name: str) -> str:
-       
+        """Cria um arquivo ZIP contendo o CSV processado"""
         try:
             zip_path = os.path.join(self.output_dir, zip_name)
             
@@ -218,20 +210,14 @@ class ANSProcessor:
         try:
             self._create_directories()
             
-            # 1. Baixar Anexo I
             pdf_url = self.find_anexo_i_url()
             pdf_path = self._download_file(pdf_url, "Anexo_I.pdf")
             
-            # 2. Extrair tabelas
             df = self.extract_tables_from_pdf(pdf_path)
-            
-            # 3. Processar dados
             df_cleaned = self.clean_dataframe(df)
             
-            # 4. Gerar CSV
             csv_path = self.save_to_csv(df_cleaned, "Rol_Procedimentos.csv")
             
-            # 5. Criar ZIP
             zip_name = f"Teste_{seu_nome}.zip"
             zip_path = self.create_zip(csv_path, zip_name)
             
